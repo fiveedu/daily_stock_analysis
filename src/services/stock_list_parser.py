@@ -87,6 +87,20 @@ def _normalize_index_key(value: str) -> str:
     return normalized
 
 
+def _normalize_display_name(value: str) -> str:
+    """Normalize a display name for exact name lookup only.
+
+    Exactly NFKC + trim + casefold. Deliberately **not** the identity
+    normalization of :func:`_normalize_index_key`, which rewrites exchange
+    variants (``000016.SH`` collapses to ``sh000016``): code-shaped display
+    names that are distinct under exact text equality must stay distinct here,
+    otherwise a name lookup would falsely report them as one key or as
+    ambiguous. Display-name equality is exact-text equality after this
+    normalization — no fuzzy search.
+    """
+    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
 # ---------------------------------------------------------------------------
 # Legacy helpers (unchanged).
 # ---------------------------------------------------------------------------
@@ -392,6 +406,47 @@ class IndexRegistry:
         """
         return self._by_resolver_key.get(_normalize_index_key(key))
 
+    def find_by_display_name(self, name: str) -> Optional[IndexEntry]:
+        """Look up an index by its exact registered display name.
+
+        Only NFKC + trim + casefold exact matches are considered — no fuzzy
+        search. Display names are deliberately NOT identity aliases: this
+        lookup is independent of :meth:`find_by_explicit_key` and never feeds
+        ``_by_resolver_key`` / :func:`parse_analysis_target`, so a Chinese
+        name can never become a parser identity alias. When two registered
+        entries have NFKC/casefold-equivalent display names the lookup is
+        ambiguous and returns ``None``; callers should detect that via
+        :meth:`is_ambiguous_display_name` and ask the user for an explicit
+        code instead of falling back to stock-name resolution.
+        """
+        key = _normalize_display_name(name)
+        if not key:
+            return None
+        matches = [
+            entry
+            for entry in self._entries
+            if _normalize_display_name(entry.display_name) == key
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def is_ambiguous_display_name(self, name: str) -> bool:
+        """True when two or more registered entries share an NFKC/casefold-
+        equivalent display name, so :meth:`find_by_display_name` cannot pick
+        a single entry."""
+        key = _normalize_display_name(name)
+        if not key:
+            return False
+        return (
+            sum(
+                1
+                for entry in self._entries
+                if _normalize_display_name(entry.display_name) == key
+            )
+            > 1
+        )
+
     def find_by_bare_conflict(self, bare_code: str) -> Optional[IndexEntry]:
         """Return the index whose explicit alias base equals ``bare_code``."""
         return self._by_bare_conflict.get(_normalize_index_key(bare_code))
@@ -650,6 +705,19 @@ def parse_analysis_target(
             normalized_prefix=norm_prefix,
             normalized_code=norm_code,
             matched_index=explicit_entry,
+        )
+
+    from data_provider.us_index_mapping import normalize_us_hyphen_symbol
+
+    us_symbol = normalize_us_hyphen_symbol(raw)
+    if us_symbol:
+        return AnalysisTarget(
+            raw_input=raw_input,
+            asset_type=ParseStatus.STOCK,
+            canonical_id=us_symbol,
+            display_code=us_symbol,
+            exchange="US",
+            normalized_code=us_symbol,
         )
 
     # PR #2267 review fix: an explicit CSI form not owned by the registry must

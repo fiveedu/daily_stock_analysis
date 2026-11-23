@@ -10,21 +10,31 @@ Tools:
 import logging
 
 from src.agent.news_evidence import record_news_evidence
+from src.agent.tools.execution import get_tool_stock_identity, is_tool_cancellation_requested
 from src.agent.tools.registry import ToolParameter, ToolDefinition, ToolPolicy
+from src.core.stock_execution_context import is_current_stock_cancelled
 
 logger = logging.getLogger(__name__)
+
+
+def _stock_run_cancelled() -> bool:
+    """Avoid doing persistence work after the owning batch slot timed out."""
+    return is_current_stock_cancelled() or is_tool_cancellation_requested()
+
 
 _NEWS_READ_POLICY = ToolPolicy.declared(
     read_only=True,
     side_effects=["network_read", "db_write_cache"],
     permissions=["news:read"],
     scope_dimensions=["stock"],
+    supported_asset_types=("stock", "index"),
 )
 _INTEL_READ_POLICY = ToolPolicy.declared(
     read_only=True,
     side_effects=["network_read", "db_write_cache"],
     permissions=["intel:read"],
     scope_dimensions=["stock"],
+    supported_asset_types=("stock", "index"),
 )
 
 
@@ -41,6 +51,9 @@ def _get_search_service():
 
 
 def _canonical_search_code(stock_code: str) -> str:
+    identity = get_tool_stock_identity(stock_code)
+    if identity is not None:
+        return identity.stock_code
     from data_provider.base import canonical_stock_code, normalize_stock_code
     from src.services.stock_list_parser import ParseStatus, parse_analysis_target
 
@@ -52,6 +65,12 @@ def _canonical_search_code(stock_code: str) -> str:
 
 
 def _resolve_search_subject(stock_code: str, stock_name: str) -> tuple[str, str]:
+    identity = get_tool_stock_identity(stock_code)
+    if identity is not None:
+        if identity.asset_type == "index":
+            return "", identity.stock_name or identity.stock_code
+        # A model-provided label is not evidence for the accepted subject.
+        return identity.stock_code, identity.stock_name or identity.stock_code
     from src.services.stock_list_parser import ParseStatus, parse_analysis_target
 
     target = parse_analysis_target(stock_code)
@@ -68,12 +87,17 @@ def _persist_news_response(
     response,
 ) -> None:
     """Best-effort news persistence for Agent search tools."""
+    if _stock_run_cancelled():
+        return
     if not response or not getattr(response, "success", False) or not getattr(response, "results", None):
         return
 
     code = _canonical_search_code(stock_code)
     try:
-        saved_count = _get_db().save_news_intel(
+        db = _get_db()
+        if _stock_run_cancelled():
+            return
+        saved_count = db.save_news_intel(
             code=code,
             name=stock_name,
             dimension=dimension,
@@ -104,7 +128,13 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
     if not service.is_available:
         return {"error": "No search engine available (no API keys configured)"}
 
+    if _stock_run_cancelled():
+        return {"error": "Stock analysis timed out before searching news"}
     response = service.search_stock_news(query_code, query_name, max_results=5)
+
+    if _stock_run_cancelled():
+        record_news_evidence(0)
+        return {"error": "Stock analysis timed out while searching news"}
 
     if not response.success:
         # 检索已发起但失败：Agent 这一轮没有拿到新闻证据，必须记 0 而不是不记，
@@ -178,11 +208,17 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
     if not service.is_available:
         return {"error": "No search engine available (no API keys configured)"}
 
+    if _stock_run_cancelled():
+        return {"error": "Stock analysis timed out before searching intelligence"}
     intel_results = service.search_comprehensive_intel(
         stock_code=query_code,
         stock_name=query_name,
         max_searches=6,
     )
+
+    if _stock_run_cancelled():
+        record_news_evidence(0)
+        return {"error": "Stock analysis timed out while searching intelligence"}
 
     if not intel_results:
         # 多维检索已发起但整体没有结果，同样必须记 0（见 _handle_search_stock_news）。

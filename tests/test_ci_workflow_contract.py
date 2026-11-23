@@ -73,6 +73,13 @@ def test_heavy_ci_jobs_are_path_filtered_and_backend_tests_are_sharded() -> None
         str(frontend_filter_step["with"]["filters"]),
         Loader=yaml.BaseLoader,
     )
+    site_filter_step = next(
+        step for step in changes_job["steps"] if step.get("id") == "site-filter"
+    )
+    site_filters = yaml.load(
+        str(site_filter_step["with"]["filters"]),
+        Loader=yaml.BaseLoader,
+    )
 
     assert changes_job["outputs"]["backend"] == (
         "${{ steps.backend-filter.outputs.backend_non_web == 'true' || "
@@ -86,9 +93,18 @@ def test_heavy_ci_jobs_are_path_filtered_and_backend_tests_are_sharded() -> None
     assert filter_step["with"]["predicate-quantifier"] == "every"
     assert backend_filter_step["with"]["predicate-quantifier"] == "every"
     assert frontend_filter_step["with"]["predicate-quantifier"] == "every"
+    assert site_filter_step["with"]["predicate-quantifier"] == "every"
+    assert len(site_filters["site_code"]) == 1
+    assert set(_expand_brace_pattern(site_filters["site_code"][0])) == {
+        "apps/dsa-site/**",
+        "docs/**",
+        "strategies/README.md",
+        ".github/workflows/ci.yml",
+    }
     assert backend_filters["backend_non_web"] == [
         "**",
         "!apps/dsa-web/**",
+        "!apps/dsa-site/**",
         "!docs/**",
         "!**/*.md",
         "!LICENSE",
@@ -132,6 +148,9 @@ def test_heavy_ci_jobs_are_path_filtered_and_backend_tests_are_sharded() -> None
     assert backend_gate_job["if"] == "always()"
     assert docker_job["needs"] == ["changes", "ai-governance"]
     assert docker_job["if"] == "needs.changes.outputs.docker == 'true'"
+    site_gate_job = ci["jobs"]["site-gate"]
+    assert site_gate_job["needs"] == ["changes", "ai-governance"]
+    assert site_gate_job["if"] == "needs.changes.outputs.site == 'true'"
 
     install_step = next(
         step
@@ -180,6 +199,13 @@ def test_backend_filter_covers_mixed_changes_and_shared_web_assets() -> None:
         str(frontend_filter_step["with"]["filters"]),
         Loader=yaml.BaseLoader,
     )["frontend_code"]
+    site_filter_step = next(
+        step for step in changes_job["steps"] if step.get("id") == "site-filter"
+    )
+    site_filters = yaml.load(
+        str(site_filter_step["with"]["filters"]),
+        Loader=yaml.BaseLoader,
+    )["site_code"]
 
     def outputs(changed_paths: list[str]) -> tuple[bool, bool, bool, bool]:
         backend = (
@@ -222,3 +248,23 @@ def test_backend_filter_covers_mixed_changes_and_shared_web_assets() -> None:
     )
     assert outputs(["apps/dsa-web/public/stocks.index.json"])[0] is True
     assert outputs(["apps/dsa-web/public/runtime/new-asset.json"])[0] is True
+    assert _filter_output(["apps/dsa-site/src/pages/index.astro"], site_filters)
+    assert _filter_output(["docs/data-center-diagnostics.md"], site_filters)
+    assert _filter_output(["docs/architecture/api_spec.json"], site_filters)
+    assert _filter_output(["docs/CHANGELOG.md"], site_filters)
+    assert _filter_output(["strategies/README.md"], site_filters)
+    assert _filter_output([".github/workflows/ci.yml"], site_filters)
+    assert not _filter_output(["src/config.py"], site_filters)
+    assert not _filter_output(["apps/dsa-web/src/App.tsx"], site_filters)
+
+
+def test_browser_fixture_and_default_smoke_entrypoints_stay_separate() -> None:
+    smoke = _read("apps/dsa-web/playwright.config.ts")
+    fixture = _read("apps/dsa-web/playwright.fixture.config.ts")
+    assert "testIgnore: '**/fixtures/**'" in smoke
+    assert "testDir: './e2e/fixtures'" in fixture
+    assert "webServer:" in fixture
+    steps = _workflow(".github/workflows/ci.yml")["jobs"]["web-gate"]["steps"]
+    default = next(step for step in steps if step.get("run") == "npm run test:smoke")
+    assert default["env"]["DSA_WEB_SMOKE_PASSWORD"] == ""
+    assert any(step.get("run") == "npx playwright test --config playwright.fixture.config.ts" for step in steps)

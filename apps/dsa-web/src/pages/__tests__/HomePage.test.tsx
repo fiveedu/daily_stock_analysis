@@ -566,6 +566,7 @@ describe('HomePage', () => {
     // (`sh000016`) — the registry-resolved identity must bridge them without
     // crossing into the bare `000016` stock row.
     vi.mocked(systemConfigApi.getWatchlist).mockResolvedValue(['000016.SH', '000016']);
+    vi.mocked(systemConfigApi.removeFromWatchlist).mockResolvedValue(['000016.SH']);
     vi.mocked(historyApi.getStockBarList).mockResolvedValue({
       total: 2,
       items: [
@@ -651,6 +652,11 @@ describe('HomePage', () => {
     expect(stockRow).not.toHaveTextContent('上证50');
     expect(stockRow).toHaveTextContent('任务等待中');
     expect(stockRow).not.toHaveTextContent('任务分析中');
+
+    fireEvent.click(screen.getByRole('button', { name: '从自选股移除 000016' }));
+    await waitFor(() => expect(screen.queryByTestId('watchlist-row-000016')).not.toBeInTheDocument());
+    expect(systemConfigApi.removeFromWatchlist).toHaveBeenCalledWith('000016');
+    expect(screen.getByTestId('watchlist-row-000016.SH')).toHaveTextContent('上证50');
   });
 
   it('keeps the watchlist workspace loading and defers history lookup until the index registry is ready (PR #2312)', async () => {
@@ -2236,6 +2242,49 @@ describe('HomePage', () => {
     expect(vi.mocked(analysisApi.getTasks).mock.calls.length).toBeGreaterThan(taskRefreshCallsBeforeSubmit);
   });
 
+  it('analyzes a watchlist with a legacy class share and removes a Yahoo preferred share', async () => {
+    configureWatchlistBatch(0);
+    vi.mocked(systemConfigApi.getWatchlist).mockResolvedValue(['BRK-B', 'AAPL', 'BAC-PL']);
+    vi.mocked(analysisApi.analyzeAsync).mockImplementation(async () => {
+      const accepted = ['BRK.B', 'AAPL', 'BAC-PL'].map((stockCode) => ({
+        taskId: `task-${stockCode}`,
+        stockCode,
+        status: 'pending' as const,
+        progress: 0,
+        reportType: 'detailed',
+        createdAt: '2026-03-19T08:00:00Z',
+      }));
+      vi.mocked(analysisApi.getTasks).mockResolvedValue({
+        total: accepted.length,
+        pending: accepted.length,
+        processing: 0,
+        tasks: accepted,
+      });
+      return { accepted, duplicates: [], message: 'accepted' };
+    });
+    vi.mocked(systemConfigApi.removeFromWatchlist).mockResolvedValue(['BRK-B', 'AAPL']);
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '自选' }));
+    fireEvent.click(await screen.findByRole('button', { name: '分析全部' }));
+    expect(await screen.findByText('已提交 3 个任务，0 个正在运行')).toBeInTheDocument();
+    expect(screen.getByTestId('watchlist-row-BRK-B')).toHaveTextContent('任务等待中');
+    expect(analysisApi.analyzeAsync).toHaveBeenCalledWith(expect.objectContaining({
+      stockCodes: ['BRK-B', 'AAPL', 'BAC-PL'],
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: '从自选股移除 BAC-PL' }));
+    await waitFor(() => expect(screen.queryByTestId('watchlist-row-BAC-PL')).not.toBeInTheDocument());
+    expect(systemConfigApi.removeFromWatchlist).toHaveBeenCalledWith('BAC-PL');
+    expect(screen.getByTestId('watchlist-row-BRK-B')).toBeInTheDocument();
+    expect(screen.getByTestId('watchlist-row-AAPL')).toBeInTheDocument();
+  });
+
   it('deduplicates index aliases while keeping the same-code stock in analyze-all (PR #2312)', async () => {
     stockIndexItems = [
       { canonicalCode: 'sh000016', displayCode: 'sh000016', aliases: ['000016.SH'], assetType: 'index' },
@@ -3176,6 +3225,85 @@ describe('HomePage', () => {
     expect(screen.getByText('正在抓取最新行情')).toBeInTheDocument();
   });
 
+  it('excludes watchlist rows with active tasks from pending batch submissions', async () => {
+    const activeTask = {
+      taskId: 'task-600519',
+      stockCode: '600519',
+      stockName: '贵州茅台',
+      status: 'processing' as const,
+      progress: 45,
+      message: '正在抓取最新行情',
+      reportType: 'detailed' as const,
+      createdAt: '2026-03-18T08:00:00Z',
+    };
+    vi.mocked(systemConfigApi.getWatchlist).mockResolvedValue(['600519', 'AAPL']);
+    vi.mocked(historyApi.getStockBarList).mockResolvedValue({
+      total: 2,
+      items: [
+        {
+          id: 11,
+          stockCode: '600519',
+          stockName: '贵州茅台',
+          reportType: 'detailed',
+          sentimentScore: 72,
+          operationAdvice: '观察',
+          analysisCount: 1,
+          lastAnalysisTime: '2026-01-01T09:00:00+08:00',
+        },
+        {
+          id: 12,
+          stockCode: 'AAPL',
+          stockName: 'Apple',
+          reportType: 'detailed',
+          sentimentScore: 68,
+          operationAdvice: '中性',
+          analysisCount: 1,
+          lastAnalysisTime: '2026-01-01T09:20:00+08:00',
+        },
+      ],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(analysisApi.getTasks).mockResolvedValue({
+      total: 1,
+      pending: 0,
+      processing: 1,
+      tasks: [activeTask],
+    });
+    vi.mocked(analysisApi.analyzeAsync).mockResolvedValue({
+      taskId: 'task-aapl',
+      status: 'pending',
+    });
+
+    useStockPoolStore.setState({
+      activeTasks: [activeTask],
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '自选' }));
+
+    const analyzePendingButton = screen.getByRole('button', { name: '仅未分析' });
+    expect(analyzePendingButton).toBeEnabled();
+    fireEvent.click(analyzePendingButton);
+
+    await waitFor(() => {
+      expect(analysisApi.analyzeAsync).toHaveBeenCalledWith(expect.objectContaining({
+        stockCodes: ['AAPL'],
+      }));
+    });
+    expect(analysisApi.analyzeAsync).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(analysisApi.analyzeAsync).mock.calls[0]?.[0].stockCodes).not.toContain('600519');
+  });
+
   it('triggers reanalyze for the current report even if the search input has other text', async () => {
     vi.mocked(historyApi.getList).mockResolvedValue({
       total: 1,
@@ -3431,5 +3559,112 @@ describe('HomePage', () => {
     expect(await screen.findByText('大盘复盘摘要')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '市场情绪与赚钱效应' })).toBeInTheDocument();
     expect(vi.mocked(historyApi.getDetail)).toHaveBeenCalledWith(2);
+  });
+
+  it('shows sample preview when setup is incomplete and hides quick-try chips', async () => {
+    vi.mocked(historyApi.getStockBarList).mockResolvedValue({
+      total: 0,
+      items: [],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(systemConfigApi.getSetupStatus).mockResolvedValue({
+      isComplete: false,
+      readyForSmoke: false,
+      requiredMissingKeys: ['llm_primary'],
+      nextStepKey: 'llm_primary',
+      checks: [
+        {
+          key: 'llm_primary',
+          title: 'LLM 主渠道',
+          category: 'ai_model',
+          required: true,
+          status: 'needs_action',
+          message: '缺少主模型配置',
+        },
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const settingsButton = await screen.findByRole('button', { name: '前往系统设置' });
+    expect(screen.queryByRole('button', { name: /600519/ })).not.toBeInTheDocument();
+
+    fireEvent.click(settingsButton);
+    expect(navigateMock).toHaveBeenCalledWith('/settings');
+
+    fireEvent.click(screen.getByRole('button', { name: '预览示例报告' }));
+    expect(await screen.findByText('当前为内置示例报告（非实时行情）')).toBeInTheDocument();
+    expect(screen.getByText('贵州茅台（示例报告）')).toBeInTheDocument();
+    expect(vi.mocked(analysisApi.analyzeAsync)).not.toHaveBeenCalled();
+    expect(vi.mocked(historyApi.getNews)).not.toHaveBeenCalled();
+    expect(vi.mocked(historyApi.getDiagnostics)).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '收起示例' }));
+    expect(await screen.findByRole('button', { name: '预览示例报告' })).toBeInTheDocument();
+  });
+
+  it('triggers analysis from quick-try ticker chips including Taiwan .TW codes in empty state', async () => {
+    vi.mocked(historyApi.getStockBarList).mockResolvedValue({
+      total: 0,
+      items: [],
+    });
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(analysisApi.analyzeAsync).mockResolvedValue({
+      taskId: 'quick-task-1',
+      status: 'pending',
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const tsmcChip = await screen.findByRole('button', { name: /2330\.TW\s*台积电/ });
+    expect(screen.getByRole('button', { name: /600519\s*贵州茅台/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /hk00700\s*腾讯控股/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /AAPL\s*苹果/ })).toBeInTheDocument();
+
+    fireEvent.click(tsmcChip);
+    await waitFor(() => {
+      expect(vi.mocked(analysisApi.analyzeAsync)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          stockCode: '2330.TW',
+          stockName: '台积电',
+          originalQuery: '2330.TW',
+          selectionSource: 'manual',
+        }),
+      );
+    });
+  });
+
+  it('pre-fills stock query input from ?stock= query param without auto-submitting analysis', async () => {
+    vi.mocked(historyApi.getStockBarList).mockResolvedValue({ total: 0, items: [] });
+    vi.mocked(historyApi.getList).mockResolvedValue({ total: 0, page: 1, limit: 20, items: [] });
+
+    render(
+      <MemoryRouter initialEntries={['/?stock=600519']}>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    const input = await screen.findByPlaceholderText(/输入股票代码/);
+    await waitFor(() => expect((input as HTMLInputElement).value).toBe('600519'));
+    expect(navigateMock).toHaveBeenCalledWith('/', { replace: true, state: null });
+    expect(vi.mocked(analysisApi.analyzeAsync)).not.toHaveBeenCalled();
   });
 });
